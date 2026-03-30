@@ -233,6 +233,50 @@ models:
   #   supports_thinking: true
 
   
+  # Example: Snowflake Cortex — OpenAI-compatible endpoint (non-Claude models)
+  # Uses SnowflakeChatModel which targets /api/v2/cortex/v1/chat/completions.
+  # Auth: key-pair JWT (auto-refresh) or Programmatic Access Token (PAT).
+  # Account identifier: first segment only, e.g. "myorg-myaccount" (not the full host).
+  # Docs: https://docs.snowflake.com/en/user-guide/snowflake-cortex/cortex-rest-api
+  #
+  # Option A: Key-pair JWT (recommended for service accounts — auto-refreshes every hour)
+  # - name: snowflake-llama3
+  #   display_name: Snowflake Cortex (Llama 3.3 70B)
+  #   use: deerflow.models.snowflake_provider:SnowflakeChatModel
+  #   model: snowflake-llama-3.3-70b
+  #   snowflake_account: $SNOWFLAKE_ACCOUNT          # e.g. myorg-myaccount
+  #   snowflake_user: $SNOWFLAKE_USER                # Snowflake username
+  #   snowflake_private_key_path: $SNOWFLAKE_PRIVATE_KEY_PATH    # path to PEM private key
+  #   snowflake_private_key_passphrase: $SNOWFLAKE_PRIVATE_KEY_PASSPHRASE  # omit if unencrypted
+  #   max_completion_tokens: 4096
+  #   temperature: 0.7
+  #
+  # Option B: Programmatic Access Token (simpler, no key management)
+  # - name: snowflake-gpt5
+  #   display_name: Snowflake Cortex (GPT-5)
+  #   use: deerflow.models.snowflake_provider:SnowflakeChatModel
+  #   model: gpt-5
+  #   snowflake_account: $SNOWFLAKE_ACCOUNT
+  #   snowflake_pat_token: $SNOWFLAKE_PAT_TOKEN
+  #   max_completion_tokens: 4096
+  #   temperature: 0.7
+
+  # Example: Snowflake Cortex — Anthropic Messages endpoint (Claude models only)
+  # Uses SnowflakeClaudeChatModel which targets /api/v2/cortex/v1/messages.
+  # Inherits prompt caching and thinking budget from ClaudeChatModel.
+  # - name: snowflake-claude-sonnet
+  #   display_name: Snowflake Cortex (Claude Sonnet 4.6)
+  #   use: deerflow.models.snowflake_claude_provider:SnowflakeClaudeChatModel
+  #   model: claude-sonnet-4-6
+  #   snowflake_account: $SNOWFLAKE_ACCOUNT
+  #   snowflake_pat_token: $SNOWFLAKE_PAT_TOKEN
+  #   max_tokens: 16384
+  #   supports_vision: true
+  #   supports_thinking: true
+  #   when_thinking_enabled:
+  #     thinking:
+  #       type: enabled
+
   # Example: OpenRouter (OpenAI-compatible)
   # OpenRouter models use the same ChatOpenAI + base_url pattern as other OpenAI-compatible gateways.
   # - name: openrouter-gemini-2.5-flash

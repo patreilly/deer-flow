@@ -1,6 +1,6 @@
-"""Auto-load credentials from Claude Code CLI and Codex CLI.
+"""Auto-load credentials from Claude Code CLI, Codex CLI, and Snowflake.
 
-Implements two credential strategies:
+Implements three credential strategies:
   1. Claude Code OAuth token from explicit env vars or an exported credentials file
      - Uses Authorization: Bearer header (NOT x-api-key)
      - Requires anthropic-beta: oauth-2025-04-20,claude-code-20250219
@@ -10,8 +10,16 @@ Implements two credential strategies:
      - Uses chatgpt.com/backend-api/codex/responses endpoint
      - Supports both legacy top-level tokens and current nested tokens shape
      - Override path with $CODEX_AUTH_PATH
+  3. Snowflake credentials for Cortex REST API
+     - Supports three token types: KEYPAIR_JWT, PROGRAMMATIC_ACCESS_TOKEN, OAUTH
+     - All use Authorization: Bearer <token> + X-Snowflake-Authorization-Token-Type header
+     - Key-pair JWT is generated from a PEM private key (PKCS#8); max lifetime 3600s
+     - Env vars: SNOWFLAKE_ACCOUNT, SNOWFLAKE_USER, SNOWFLAKE_PRIVATE_KEY_PATH,
+       SNOWFLAKE_PRIVATE_KEY_PASSPHRASE (optional), SNOWFLAKE_PAT_TOKEN, SNOWFLAKE_JWT_TOKEN
 """
 
+import base64
+import hashlib
 import json
 import logging
 import os
@@ -191,6 +199,180 @@ def load_claude_code_credential() -> ClaudeCodeCredential | None:
             source_label = "override path" if override_path_obj is not None and cred_path == override_path_obj else "plaintext file"
             logger.info(f"Loaded Claude Code OAuth credential from {source_label} (expires_at={cred.expires_at})")
             return cred
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Snowflake
+# ---------------------------------------------------------------------------
+
+#: Refresh JWT this many seconds before it expires to avoid mid-request failure.
+_SNOWFLAKE_JWT_REFRESH_BUFFER = 300
+
+
+@dataclass
+class SnowflakeCredential:
+    """Snowflake Cortex REST API credential.
+
+    Covers all three token types accepted by the API:
+      - KEYPAIR_JWT          — RS256 JWT generated from a PEM private key
+      - PROGRAMMATIC_ACCESS_TOKEN — static PAT; no expiry, no auto-refresh
+      - OAUTH                — pre-obtained OAuth Bearer token
+    """
+
+    account: str
+    token: str
+    token_type: str  # "KEYPAIR_JWT" | "PROGRAMMATIC_ACCESS_TOKEN" | "OAUTH"
+    user: str = ""
+    expires_at: float = 0.0  # Unix timestamp; 0 = unknown / non-expiring
+    source: str = ""
+
+    @property
+    def is_expired(self) -> bool:
+        """True if the token is within the refresh buffer window."""
+        if self.expires_at <= 0:
+            return False
+        return time.time() > self.expires_at - _SNOWFLAKE_JWT_REFRESH_BUFFER
+
+
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def generate_snowflake_jwt(
+    account: str,
+    user: str,
+    private_key_path: str,
+    passphrase: str = "",
+    lifetime_seconds: int = 3600,
+) -> tuple[str, float]:
+    """Generate a Snowflake RS256 key-pair JWT.
+
+    Uses only the ``cryptography`` package (already a transitive dependency via
+    ``anthropic``).  No ``PyJWT`` required.
+
+    Returns ``(token, expires_at)`` where ``expires_at`` is a Unix timestamp.
+
+    Raises ``ValueError`` if the key file is missing or unreadable.
+    Raises ``ImportError`` if ``cryptography`` is not installed.
+
+    Account identifier formatting:
+      Snowflake expects the *first segment* of the account identifier, uppercased.
+      E.g. ``myorg-myaccount.us-east-1.aws`` → ``MYORG-MYACCOUNT``.
+    """
+    try:
+        from cryptography.hazmat.backends import default_backend
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import padding
+    except ImportError as exc:
+        raise ImportError(
+            "The 'cryptography' package is required for Snowflake key-pair JWT generation. "
+            "Install it with: pip install cryptography"
+        ) from exc
+
+    key_path = Path(private_key_path).expanduser()
+    if not key_path.exists():
+        raise ValueError(f"Snowflake private key not found: {key_path}")
+
+    key_data = key_path.read_bytes()
+    password = passphrase.encode() if passphrase else None
+
+    try:
+        private_key = serialization.load_pem_private_key(key_data, password=password, backend=default_backend())
+    except Exception as exc:
+        raise ValueError(f"Failed to load Snowflake private key from {key_path}: {exc}") from exc
+
+    # Derive public key fingerprint: SHA256 of DER-encoded SubjectPublicKeyInfo, base64-encoded
+    pub_der = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    fingerprint = "SHA256:" + base64.b64encode(hashlib.sha256(pub_der).digest()).decode()
+
+    # Snowflake requires the first segment of the account identifier, uppercased
+    account_id = account.split(".")[0].upper()
+    qualified_user = f"{account_id}.{user.upper()}"
+
+    now = int(time.time())
+    payload = {
+        "iss": f"{qualified_user}.{fingerprint}",
+        "sub": qualified_user,
+        "iat": now,
+        "exp": now + lifetime_seconds,
+    }
+
+    header = {"alg": "RS256", "typ": "JWT"}
+    header_b64 = _b64url(json.dumps(header, separators=(",", ":")).encode())
+    payload_b64 = _b64url(json.dumps(payload, separators=(",", ":")).encode())
+    signing_input = f"{header_b64}.{payload_b64}".encode()
+
+    signature = private_key.sign(signing_input, padding.PKCS1v15(), hashes.SHA256())
+    token = f"{header_b64}.{payload_b64}.{_b64url(signature)}"
+
+    return token, float(now + lifetime_seconds)
+
+
+def load_snowflake_credential() -> SnowflakeCredential | None:
+    """Load a Snowflake credential from environment variables.
+
+    Lookup order:
+      1. ``SNOWFLAKE_PRIVATE_KEY_PATH`` + ``SNOWFLAKE_USER`` + ``SNOWFLAKE_ACCOUNT``
+         → generates a fresh KEYPAIR_JWT (auto-refresh capable)
+      2. ``SNOWFLAKE_PAT_TOKEN`` + ``SNOWFLAKE_ACCOUNT``
+         → static Programmatic Access Token (no expiry)
+      3. ``SNOWFLAKE_JWT_TOKEN`` + ``SNOWFLAKE_ACCOUNT``
+         → pre-generated JWT (no auto-refresh; will expire in ~1 h)
+
+    Returns ``None`` if no Snowflake credentials are found.
+    """
+    account = os.getenv("SNOWFLAKE_ACCOUNT", "").strip()
+    if not account:
+        return None
+
+    # 1. Key-pair JWT (preferred — enables auto-refresh)
+    key_path = os.getenv("SNOWFLAKE_PRIVATE_KEY_PATH", "").strip()
+    user = os.getenv("SNOWFLAKE_USER", "").strip()
+    if key_path and user:
+        passphrase = os.getenv("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE", "")
+        try:
+            token, expires_at = generate_snowflake_jwt(account, user, key_path, passphrase)
+            logger.info(f"Generated Snowflake KEYPAIR_JWT for {user}@{account}")
+            return SnowflakeCredential(
+                account=account,
+                user=user,
+                token=token,
+                token_type="KEYPAIR_JWT",
+                expires_at=expires_at,
+                source="env-keypair",
+            )
+        except Exception as exc:
+            logger.warning(f"Failed to generate Snowflake JWT: {exc}")
+
+    # 2. Programmatic Access Token
+    pat = os.getenv("SNOWFLAKE_PAT_TOKEN", "").strip()
+    if pat:
+        logger.info(f"Loaded Snowflake PAT for account {account}")
+        return SnowflakeCredential(
+            account=account,
+            token=pat,
+            token_type="PROGRAMMATIC_ACCESS_TOKEN",
+            source="env-pat",
+        )
+
+    # 3. Pre-generated JWT (no auto-refresh)
+    jwt_token = os.getenv("SNOWFLAKE_JWT_TOKEN", "").strip()
+    if jwt_token:
+        logger.warning(
+            "Using pre-generated SNOWFLAKE_JWT_TOKEN — no auto-refresh. "
+            "Token will expire in ~1 hour."
+        )
+        return SnowflakeCredential(
+            account=account,
+            token=jwt_token,
+            token_type="KEYPAIR_JWT",
+            source="env-jwt-pregenerated",
+        )
 
     return None
 
