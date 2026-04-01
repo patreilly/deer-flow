@@ -57,7 +57,7 @@ from deerflow.models.claude_provider import ClaudeChatModel
 
 logger = logging.getLogger(__name__)
 
-_CORTEX_MESSAGES_PATH = "/api/v2/cortex/v1"
+_CORTEX_MESSAGES_PATH = "/api/v2/cortex"
 _DEFAULT_JWT_LIFETIME = 3600  # Snowflake maximum
 
 
@@ -159,9 +159,12 @@ class SnowflakeClaudeChatModel(ClaudeChatModel):
         snowflake_base_url = f"https://{account}.snowflakecomputing.com{_CORTEX_MESSAGES_PATH}"
         self.anthropic_api_url = snowflake_base_url
 
-        # Required headers for Snowflake Cortex Messages endpoint
+        # Required headers for Snowflake Cortex Messages endpoint.
+        # Snowflake expects Authorization: Bearer, not the x-api-key that the
+        # Anthropic SDK sends by default.
         self.default_headers = {
             **(self.default_headers or {}),
+            "authorization": f"Bearer {token}",
             "anthropic-version": "2023-06-01",
             "X-Snowflake-Authorization-Token-Type": token_type,
         }
@@ -169,6 +172,13 @@ class SnowflakeClaudeChatModel(ClaudeChatModel):
         # Disable ClaudeChatModel's OAuth billing header injection — it is
         # Anthropic-specific and would cause a 400 on Snowflake.
         self._is_oauth = False
+
+        # Snowflake Cortex limits cache_control blocks to 4; ClaudeChatModel's
+        # _apply_prompt_caching can generate 5–6 blocks (system + messages +
+        # tools), causing 400 "A maximum of 4 blocks with cache_control may be
+        # provided."  Disable prompt caching entirely for Snowflake — the same
+        # approach already used for OAuth tokens in ClaudeChatModel.
+        self.enable_prompt_caching = False
 
         super().model_post_init(__context)
 
@@ -200,6 +210,10 @@ class SnowflakeClaudeChatModel(ClaudeChatModel):
         )
         self._sf_token_expires_at = expires_at
         self.anthropic_api_key = SecretStr(new_token)
+
+        # Keep the Authorization: Bearer header in sync with the new token
+        if isinstance(self.default_headers, dict):
+            self.default_headers["authorization"] = f"Bearer {new_token}"
 
         # Patch live clients so the new token is used immediately
         for client in (getattr(self, "_client", None), getattr(self, "_async_client", None)):
